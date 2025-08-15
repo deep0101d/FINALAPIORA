@@ -28,7 +28,7 @@ import mammoth from "mammoth";
 import fs from "fs";
 import path from "path";
 import { GoogleGenerativeAI } from "@google/generative-ai";
-import * as pdfjsLib from "pdfjs-dist/legacy/build/pdf.js";
+import pdfjsLib from "pdfjs-dist/legacy/build/pdf.js";
 import { fileURLToPath } from "url";
 import { exec } from "child_process";
 
@@ -86,21 +86,23 @@ async function readDocx(fp) {
   return res.value || "";
 }
 
-async function readPdf(fp) {
-  const data = await fs.promises.readFile(fp);
-  const loadingTask = pdfjsLib.getDocument({ data });
-  const pdf = await loadingTask.promise;
 
-  let out = "";
-  for (let p = 1; p <= pdf.numPages; p++) {
-    const page = await pdf.getPage(p);
+
+
+async function readPdf(filePath) {
+  const data = new Uint8Array(await fs.promises.readFile(filePath));
+  const pdf = await pdfjsLib.getDocument({ data }).promise;
+
+  let text = "";
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
     const content = await page.getTextContent();
-    const strings = content.items.map((it) => it.str);
-    out += strings.join(" ") + "\n\n";
+    text += content.items.map(item => item.str).join(" ") + "\n\n";
   }
-  return out;
+  return text;
 }
 
+export default readPdf;
 // ======= Prompt builders =======
 function promptSummary(text, lang = "English") {
   return `You are an academic summarizer. Create a deep, structured, readable summary in ${lang}.
@@ -242,6 +244,8 @@ function promptAudioSummary(transcript) {
 TRANSCRIPT:
 ${transcript}`;
 }
+
+//read PDF file and extract text
 
 // ======= ROUTES =======
 
@@ -454,16 +458,52 @@ app.post("/extract-table", async (req, res) => {
 });
 
 // 13) Generate citations
+// helper: normalize refs input (array|string) -> string
+function normalizeRefs(input) {
+  if (Array.isArray(input)) {
+    // filter out empties and join lines
+    return input
+      .map(r => (typeof r === "string" ? r : JSON.stringify(r)))
+      .map(s => s.trim())
+      .filter(Boolean)
+      .join("\n");
+  }
+  if (typeof input === "string") return input.trim();
+  // anything else (object/null/number) -> stringify minimally
+  return String(input ?? "").trim();
+}
+
+// 13) Generate citations (robust)
 app.post("/generate-citations", async (req, res) => {
-  const { references, style = "APA", language } = req.body || {};
-  if (!references || !references.trim()) return res.status(400).json({ error: "missing_references" });
   try {
-    const prompt = promptCitations(references, style);
+    const { references, style = "APA", language } = req.body || {};
+    const refsText = normalizeRefs(references);
+
+    if (!refsText) {
+      return res.status(400).json({
+        error: "missing_references",
+        hint: "Send `references` as a string OR array of strings."
+      });
+    }
+
+    // basic size guard to avoid model blowups
+    if (refsText.length > 100_000) {
+      return res.status(413).json({
+        error: "payload_too_large",
+        hint: "Keep total references under ~100k chars."
+      });
+    }
+
+    const prompt = promptCitations(refsText, style);
     let answer = await askGemini(prompt, 0.4);
-    res.json({ citations: wrapBilingual(answer, language) });
+    return res.json({ citations: wrapBilingual(answer, language) });
   } catch (e) {
-    console.error(e);
-    res.status(500).json({ error: "citations_failed", details: String(e) });
+    console.error("generate-citations_error:", e);
+    // never crash: always respond
+    return res.status(500).json({
+      error: "citations_failed",
+      details: String(e?.message || e)
+    });
   }
 });
 
